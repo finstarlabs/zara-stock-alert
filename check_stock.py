@@ -5,16 +5,21 @@ Zara Stock Alert
 как только нужный размер становится доступен для заказа.
 
 Как это работает:
-Zara встраивает данные о наличии размеров прямо в HTML-код страницы товара
-(в JSON-объект window.zara.viewPayload). Обычного HTTP-запроса достаточно,
-браузер не требуется.
+Обычная страница товара на zara.com отдаётся серверу-роботу в виде пустой
+заглушки — данные о наличии подгружаются уже в браузере. Поэтому скрипт
+берёт их напрямую из открытого JSON-эндпоинта, которым пользуется сам сайт:
 
-Возможные значения availability:
+    https://www.zara.com/us/en/products-details?productIds=<ID>&ajax=true
+
+<ID> — это число из хвоста ссылки на товар (?v1=...), то есть идентификатор
+конкретного цвета. За один запрос можно спросить до 10 товаров сразу
+(несколько параметров productIds), поэтому 38 товаров = 4 запроса.
+
+Значения availability:
   - "in_stock"      -> есть в наличии
   - "low_on_stock"  -> можно заказать, но осталось мало
   - "coming_soon"   -> товара пока нет в продаже
   - "out_of_stock"  -> товара нет
-Если сайт вернёт другой статус, скрипт выведет предупреждение в лог.
 
 ВАЖНО: редактировать нужно только products.json — см. файл
 "КАК-ОБНОВЛЯТЬ-ТОВАРЫ.md". Этот файл трогать не нужно.
@@ -34,9 +39,13 @@ import requests
 CONFIG_FILE = "products.json"
 STATE_FILE = "state.json"
 
+API_URL = "https://www.zara.com/us/en/products-details"
+CHUNK_SIZE = 10          # больше 10 сервер не принимает (отвечает 400)
+CHUNK_PAUSE_SEC = (1.0, 2.0)
+
 # Статусы, которые считаем "можно заказать прямо сейчас"
 AVAILABLE_STATUSES = {"in_stock", "low_on_stock"}
-# Статусы, которые точно означают "нельзя заказать" (не ошибка парсинга)
+# Статусы, которые точно означают "нельзя заказать" (не ошибка разбора)
 NOT_AVAILABLE_STATUSES = {"out_of_stock", "coming_soon"}
 
 # --- Окно проверки: Пн–Пт, 15:00–19:00 по Вашингтону -----------------------
@@ -46,15 +55,12 @@ ACTIVE_END_HOUR = 19     # до 19:00 (последняя проверка ~18:5
 TIMEZONE = ZoneInfo("America/New_York")  # Восточное время США (Вашингтон)
 # --------------------------------------------------------------------------
 
-# Пауза между товарами, чтобы не отправлять запросы сплошным потоком
-DELAY_MIN_SEC = 1.0
-DELAY_MAX_SEC = 2.5
-
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     ),
+    "Accept": "application/json, text/plain, */*",
     "Accept-Language": "en-US,en;q=0.9",
 }
 
@@ -101,10 +107,10 @@ def send_telegram_message(text: str) -> None:
 
 
 def normalize_size(value) -> str:
-    """Приводит размер к единому виду, чтобы 7½ = 7 1/2 = 7.5, а m = M.
+    """Приводит размер к единому виду: 7½ = 7 1/2 = 7.5, а m = M.
 
-    Обувные размеры на сайте могут быть записаны как "7½", а в products.json
-    их удобнее писать как "7.5" — эта функция делает их одинаковыми.
+    На сайте обувные размеры записаны как "7½", в products.json их удобнее
+    писать как "7.5" — эта функция делает их одинаковыми.
     """
     s = str(value).upper().strip()
     s = s.replace("¼", ".25").replace("½", ".5").replace("¾", ".75")
@@ -112,50 +118,84 @@ def normalize_size(value) -> str:
     s = re.sub(r"\s*1\s*/\s*4\b", ".25", s)
     s = re.sub(r"\s*3\s*/\s*4\b", ".75", s)
     s = s.replace(",", ".").replace(" ", "")
-    # "7.50" -> "7.5", "8.0" -> "8"
-    if re.fullmatch(r"\d+(\.\d+)?", s):
+    if re.fullmatch(r"\d+(\.\d+)?", s):   # "7.50" -> "7.5", "8.0" -> "8"
         s = f"{float(s):g}"
     return s
 
 
-def color_variant_id(url: str):
+def variant_id(url: str):
     """Достаёт из ссылки параметр v1 — идентификатор цвета товара."""
     try:
-        return parse_qs(urlparse(url).query).get("v1", [None])[0]
+        value = parse_qs(urlparse(url).query).get("v1", [None])[0]
     except ValueError:
         return None
+    return str(value) if value else None
 
 
-def pick_colors(colors, variant_id, name):
-    """Оставляет только тот цвет, что указан в ссылке (?v1=...).
+def fetch_chunk(session, ids):
+    """Спрашивает у сайта наличие для группы товаров.
 
-    Если сопоставить не удалось — проверяем все цвета и пишем об этом в лог.
-    Так уведомление придёт в любом случае, просто, возможно, по другому цвету.
+    Возвращает словарь {id_цвета: {"color": название, "sizes": [(размер, статус)]}}
+    или None, если запрос не удался.
     """
-    if not variant_id:
-        return colors, None
-    keys = ("id", "productId", "colorId", "reference", "sku")
-    for color in colors:
-        candidates = {str(color.get(k)) for k in keys if color.get(k) is not None}
-        if str(variant_id) in candidates:
-            return [color], color.get("name")
-    print(f"[info] {name}: не удалось сопоставить v1={variant_id} с конкретным "
-          f"цветом — проверяем все цвета этого товара")
-    return colors, None
-
-
-def extract_view_payload(html: str):
-    marker = "window.zara.viewPayload = "
-    idx = html.find(marker)
-    if idx == -1:
-        return None
-    start = idx + len(marker)
-    decoder = json.JSONDecoder()
+    params = [("productIds", i) for i in ids] + [("ajax", "true")]
     try:
-        data, _ = decoder.raw_decode(html[start:])
-        return data
-    except json.JSONDecodeError:
+        resp = session.get(API_URL, params=params, headers=HEADERS, timeout=30)
+    except requests.RequestException as exc:
+        print(f"[warn] запрос не удался: {exc}")
         return None
+
+    if resp.status_code != 200:
+        print(f"[warn] сайт ответил {resp.status_code} "
+              f"(длина ответа {len(resp.content)} байт)")
+        return None
+
+    try:
+        data = resp.json()
+    except ValueError:
+        print(f"[warn] сайт вернул не JSON (длина {len(resp.content)} байт). "
+              f"Начало ответа: {resp.text[:200]!r}")
+        return None
+
+    if not isinstance(data, list):
+        print(f"[warn] неожиданный ответ сайта: {str(data)[:200]}")
+        return None
+
+    result = {}
+    for product in data:
+        try:
+            colors = product["detail"]["colors"]
+        except (KeyError, TypeError):
+            continue
+        for color in colors:
+            cid = color.get("productId")
+            if cid is None:
+                continue
+            result[str(cid)] = {
+                "color": color.get("name"),
+                "sizes": [((s.get("name") or "").strip(),
+                           s.get("availability", "unknown"))
+                          for s in (color.get("sizes") or [])],
+            }
+    return result
+
+
+def fetch_all(ids):
+    """Забирает наличие для всех нужных цветов, группами по CHUNK_SIZE."""
+    session = requests.Session()
+    combined, failed_any = {}, False
+    chunks = [ids[i:i + CHUNK_SIZE] for i in range(0, len(ids), CHUNK_SIZE)]
+    for n, chunk in enumerate(chunks, start=1):
+        if n > 1:
+            time.sleep(random.uniform(*CHUNK_PAUSE_SEC))
+        part = fetch_chunk(session, chunk)
+        if part is None:
+            failed_any = True
+            print(f"[warn] группа {n} из {len(chunks)}: данные не получены")
+            continue
+        combined.update(part)
+        print(f"[ok] группа {n} из {len(chunks)}: получено цветов — {len(part)}")
+    return combined, failed_any
 
 
 def load_products():
@@ -192,19 +232,28 @@ def load_products():
             continue
         url = item.get("url")
         sizes = item.get("sizes")
+        label = item.get("name") or url or f"товар №{i}"
         if not url or not isinstance(url, str):
             problems.append(f"товар №{i}: не указан url")
             continue
         if not sizes or not isinstance(sizes, list):
-            problems.append(f"товар №{i} ({item.get('name', url)}): не указаны sizes")
+            problems.append(f"{label}: не указаны sizes")
             continue
         if item.get("active", True) is False:
-            print(f"[skip] {item.get('name', url)}: отключён (active: false)")
+            print(f"[skip] {label}: отключён (active: false)")
             continue
         if url in seen:
-            print(f"[skip] {item.get('name', url)}: такая ссылка уже есть в списке")
+            print(f"[skip] {label}: такая ссылка уже есть в списке")
+            continue
+        vid = variant_id(url)
+        if not vid:
+            problems.append(
+                f"{label}: в ссылке нет хвоста ?v1=... — откройте товар на "
+                f"сайте, выберите цвет и скопируйте адрес целиком")
             continue
         seen.add(url)
+        item = dict(item)
+        item["_vid"] = vid
         valid.append(item)
 
     if problems:
@@ -213,61 +262,6 @@ def load_products():
         send_telegram_message(msg)
 
     return valid
-
-
-def check_product(product: dict):
-    """Размеры из нужных, которые сейчас можно заказать.
-
-    Возвращает (список_размеров, название_цвета) или None, если проверить
-    не удалось (сайт не ответил и т.п.) — это не то же самое, что
-    "размеров нет".
-    """
-    url = product["url"]
-    name = product.get("name", url)
-    wanted = {normalize_size(s) for s in product["sizes"]}
-
-    try:
-        resp = requests.get(url, headers=HEADERS, timeout=20)
-        resp.raise_for_status()
-    except requests.RequestException as exc:
-        print(f"[warn] {name}: не удалось загрузить страницу — {exc}")
-        return None
-
-    payload = extract_view_payload(resp.text)
-    if not payload:
-        print(f"[warn] {name}: не нашли данные о наличии на странице "
-              f"(возможно, изменилась структура сайта)")
-        return None
-
-    try:
-        colors = payload["product"]["detail"]["colors"]
-    except (KeyError, TypeError):
-        print(f"[warn] {name}: неожиданная структура данных")
-        return None
-
-    colors, color_name = pick_colors(colors, color_variant_id(url), name)
-
-    found, seen_raw = [], []
-    for color in colors:
-        for size in color.get("sizes", []):
-            raw = (size.get("name") or "").strip()
-            seen_raw.append(raw)
-            if normalize_size(raw) not in wanted:
-                continue
-            status = size.get("availability", "unknown")
-            if status not in AVAILABLE_STATUSES and status not in NOT_AVAILABLE_STATUSES:
-                print(f"[info] {name} / {raw}: неизвестный статус наличия "
-                      f"'{status}' — возможно, стоит добавить его в AVAILABLE_STATUSES")
-            if status in AVAILABLE_STATUSES:
-                found.append(raw)
-
-    missing = wanted - {normalize_size(s) for s in seen_raw}
-    if missing:
-        print(f"[info] {name}: размера(ов) {', '.join(sorted(missing))} нет среди "
-              f"размеров этого товара. Доступные варианты: "
-              f"{', '.join(sorted(set(seen_raw))) or '—'}")
-
-    return sorted(set(found)), color_name
 
 
 def main():
@@ -282,32 +276,61 @@ def main():
         print("Нечего проверять.")
         return
 
-    print(f"Проверяем {len(products)} товар(ов)...")
+    ids = sorted({p["_vid"] for p in products})
+    print(f"Проверяем {len(products)} товар(ов), {len(ids)} цвет(ов)...")
+
+    stock, failed_any = fetch_all(ids)
+    if not stock:
+        msg = ("⚠️ Не удалось получить данные с сайта Zara ни по одному товару. "
+               "Подробности — в логах GitHub Actions.")
+        print(f"[error] {msg}")
+        send_telegram_message(msg)
+        return
+
     state = load_json(STATE_FILE, {})
     new_state = {}
 
-    for i, product in enumerate(products):
-        if i:
-            time.sleep(random.uniform(DELAY_MIN_SEC, DELAY_MAX_SEC))
-
+    for product in products:
         key = product["url"]
         name = product.get("name", key)
-        result = check_product(product)
+        vid = product["_vid"]
+        wanted = {normalize_size(s) for s in product["sizes"]}
         previously_notified = set(state.get(key, []))
 
-        if result is None:
-            # Проверить не удалось — сохраняем прошлое состояние как есть
+        entry = stock.get(vid)
+        if entry is None:
+            # Данных нет: либо запрос не прошёл, либо товар/цвет убрали с сайта
+            reason = ("запрос не прошёл" if failed_any
+                      else "товар или цвет больше не найден на сайте")
+            print(f"[warn] {name}: данных нет — {reason}")
             new_state[key] = sorted(previously_notified)
             continue
 
-        sizes_list, color_name = result
-        available_now = {normalize_size(s) for s in sizes_list}
+        found, seen_raw = [], []
+        for raw_size, status in entry["sizes"]:
+            seen_raw.append(raw_size)
+            if normalize_size(raw_size) not in wanted:
+                continue
+            if status not in AVAILABLE_STATUSES and status not in NOT_AVAILABLE_STATUSES:
+                print(f"[info] {name} / {raw_size}: неизвестный статус '{status}' "
+                      f"— возможно, стоит добавить его в AVAILABLE_STATUSES")
+            if status in AVAILABLE_STATUSES:
+                found.append(raw_size)
+
+        missing = wanted - {normalize_size(s) for s in seen_raw}
+        if missing:
+            print(f"[info] {name}: размера(ов) {', '.join(sorted(missing))} нет "
+                  f"среди размеров этого товара. Есть: "
+                  f"{', '.join(seen_raw) or '—'}")
+
+        available_now = {normalize_size(s) for s in found}
         newly_available = available_now - previously_notified
 
         if newly_available:
-            shown = ", ".join(sorted(s for s in sizes_list
-                                     if normalize_size(s) in newly_available))
-            color_line = f"\nЦвет: {color_name}" if color_name else ""
+            shown = ", ".join(s for s in found
+                              if normalize_size(s) in newly_available)
+            color = entry.get("color")
+            color_line = f"\nЦвет: {color}" if color else ""
             send_telegram_message(
                 f"🟢 Появился размер!\n"
                 f"{name}{color_line}\n"
