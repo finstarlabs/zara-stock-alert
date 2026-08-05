@@ -1,0 +1,49 @@
+name: Zara Stock Check
+
+# Расписание задаётся в UTC. Окно 15:00–19:00 по Вашингтону — это
+# 19:00–23:00 UTC летом и 20:00–00:00 UTC зимой. Поэтому запускаем
+# каждые 5 минут в 19:00–23:59 UTC по будням, а точное окно
+# (Пн–Пт 15:00–19:00 по Нью-Йорку) проверяет уже сам скрипт —
+# он умеет учитывать переход на летнее время.
+on:
+  schedule:
+    - cron: '*/5 19-23 * * 1-5'
+  workflow_dispatch: {}      # кнопка "Run workflow" для ручного запуска
+
+permissions:
+  contents: write            # нужно, чтобы сохранять state.json в репозиторий
+
+concurrency:
+  group: zara-stock-check
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run stock check
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python check_stock.py
+
+      - name: Save updated state
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add state.json
+          git diff --staged --quiet && exit 0
+          git commit -m "Update stock state"
+          git pull --rebase --autostash || true
+          git push
